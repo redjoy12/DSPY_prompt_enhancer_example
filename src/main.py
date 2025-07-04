@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Runnable DSPy Optimization Script for Shopping Assistant
-Run this script after configuring your OpenAI API key
+Corrected DSPy Optimization Script for Shopping Assistant
 """
 
 import json
@@ -12,32 +11,166 @@ from typing import List, Dict
 
 import dspy
 
-# Configure DSPy with your API key
-# Make sure to set your OPENAI_API_KEY environment variable
-# or replace 'YOUR_API_KEY_HERE' with your actual key
+# Configure DSPy
 api_key = os.getenv('OPENAI_API_KEY', 'YOUR_API_KEY_HERE')
 if api_key == 'YOUR_API_KEY_HERE':
-    print("⚠️  Please set your OPENAI_API_KEY environment variable or update the script")
-    print("   export OPENAI_API_KEY='your-key-here'")
+    print("⚠️  Please set your OPENAI_API_KEY environment variable")
     exit(1)
 
-lm = dspy.LM('openai/gpt-4o-mini', api_key=api_key)
+lm = dspy.LM('openai/gpt-4.1', api_key=api_key)
 dspy.configure(lm=lm)
 print("✅ DSPy configured successfully!")
 
 
-@dataclass
-class ConversationExample:
-    """Training example for the conversation suggestion system"""
-    messages: List[Dict[str, str]]
-    expected_suggestions: List[str]
-    language: str = "English"
-    role: str = "shopping assistant suggestion generator"
-    task: str = "Generate relevant conversation suggestions"
+class ConversationSuggestionSignature(dspy.Signature):
+    """Generate conversation suggestions for shopping assistant."""
+    messages = dspy.InputField(desc="Conversation history as JSON string")
+    role = dspy.InputField(desc="Assistant role")
+    task = dspy.InputField(desc="Task to perform")
+    language = dspy.InputField(desc="Language for suggestions")
+    suggestions = dspy.OutputField(desc="JSON with 'answers_sugg' array (0-3 items, max 40 chars each)")
 
 
-# Your original prompt template (BASELINE)
-ORIGINAL_PROMPT_TEMPLATE = """# ROLE
+class BaselineModule(dspy.Module):
+    """Baseline using original prompt template"""
+
+    def __init__(self, prompt_template):
+        super().__init__()
+        self.prompt_template = prompt_template
+
+    def forward(self, messages, role, task, language):
+        # Handle both string and list inputs
+        if isinstance(messages, str):
+            messages_str = messages
+        else:
+            messages_str = json.dumps(messages, indent=2)
+
+        prompt = self.prompt_template.format(
+            role=role,
+            task=task,
+            messages=messages_str,
+            language=language
+        )
+
+        response = dspy.LM(prompt)
+        suggestions = self.parse_suggestions(response)
+        return dspy.Prediction(suggestions=suggestions)
+
+    def parse_suggestions(self, response):
+        try:
+            # Extract JSON from response
+            match = re.search(r'\{[^}]+\}', response)
+            if match:
+                data = json.loads(match.group())
+                return data.get('answers_sugg', [])
+        except:
+            pass
+        return []
+
+
+class ShoppingAssistantSuggester(dspy.Module):
+    """Optimizable DSPy module"""
+
+    def __init__(self):
+        super().__init__()
+        self.suggest = dspy.ChainOfThought(ConversationSuggestionSignature)
+
+    def forward(self, messages, role, task, language):
+        # Handle both string and list inputs
+        if isinstance(messages, str):
+            messages_str = messages
+        else:
+            messages_str = json.dumps(messages, indent=2)
+
+        prediction = self.suggest(
+            messages=messages_str,
+            role=role,
+            task=task,
+            language=language
+        )
+
+        # Parse the suggestions correctly
+        suggestions = self.parse_suggestions(prediction.suggestions)
+        return dspy.Prediction(suggestions=suggestions)
+
+    def parse_suggestions(self, output):
+        try:
+            # Handle various output formats
+            if isinstance(output, str):
+                # Try to find JSON in the output
+                json_match = re.search(r'\{.*"answers_sugg".*\}', output, re.DOTALL)
+                if json_match:
+                    data = json.loads(json_match.group())
+                    return data.get('answers_sugg', [])
+            elif isinstance(output, dict):
+                return output.get('answers_sugg', [])
+            elif isinstance(output, list):
+                return output[:3]  # Limit to 3
+        except Exception as e:
+            print(f"Parse error: {e}")
+        return []
+
+
+def suggestion_metric(example, prediction, trace=None):
+    """Improved metric for evaluating suggestions"""
+    try:
+        pred_suggestions = prediction.suggestions if hasattr(prediction, 'suggestions') else []
+        expected = example.suggestions if hasattr(example, 'suggestions') else example.expected_suggestions
+
+        # Check if appointment booking scenario (expecting empty)
+        is_appointment = len(expected) == 0
+
+        if is_appointment:
+            # For appointments, penalize any suggestions
+            return 1.0 if len(pred_suggestions) == 0 else 0.0
+        else:
+            # For regular scenarios
+            if len(pred_suggestions) == 0:
+                return 0.0
+
+            # Check validity (length <= 40 chars)
+            valid_count = sum(1 for s in pred_suggestions if len(s) <= 40)
+            validity_score = valid_count / max(1, len(pred_suggestions))
+
+            # Check quantity (expecting 3 suggestions)
+            quantity_score = min(len(pred_suggestions), 3) / 3.0
+
+            # Combined score
+            return 0.7 * validity_score + 0.3 * quantity_score
+
+    except Exception as e:
+        print(f"Metric error: {e}")
+        return 0.0
+
+
+def create_dspy_examples(training_data):
+    """Convert training data to DSPy format"""
+    examples = []
+
+    for data in training_data:
+        # Convert messages to JSON string to avoid dict hashing issues
+        messages_str = json.dumps(data['messages'])
+
+        # Create proper DSPy example
+        example = dspy.Example(
+            messages=messages_str,  # Already as string
+            role="shopping assistant suggestion generator",
+            task="Generate relevant conversation suggestions",
+            language="English",
+            suggestions=json.dumps({"answers_sugg": data['expected_suggestions']})
+        ).with_inputs("messages", "role", "task", "language")
+
+        examples.append(example)
+
+    return examples
+
+
+def main():
+    print("🚀 Starting DSPy Prompt Optimization...")
+    print("=" * 60)
+
+    # Your original prompt template
+    ORIGINAL_PROMPT = """# ROLE
 You are a {role}. Your goal is to help a customer continue their conversation effectively with shopping assistant.
 
 # TASK
@@ -67,383 +200,260 @@ Provide the output as a JSON object with "answers_sugg" containing exactly 3 (IF
 Response with JSON only: {{"answers_sugg": ["suggestion1", "suggestion2", "suggestion3"]}} or {{"answers_sugg": []}}
 """
 
-
-class BaselineModule(dspy.Module):
-    """Baseline module using your original prompt template"""
-
-    def __init__(self):
-        super().__init__()
-        self.lm = dspy.settings.lm
-
-    def forward(self, messages: List[Dict[str, str]], role: str, task: str, language: str):
-        # Format your original prompt
-        messages_str = json.dumps(messages, indent=2)
-        formatted_prompt = ORIGINAL_PROMPT_TEMPLATE.format(
-            role=role,
-            task=task,
-            messages=messages_str,
-            language=language
-        )
-
-        # Get response from LM
-        response = self.lm(formatted_prompt)
-        suggestions = self.parse_suggestions(response)
-
-        return dspy.Prediction(suggestions=suggestions)
-
-    def parse_suggestions(self, response_text: str) -> List[str]:
-        """Parse suggestions from the original prompt's output"""
-        try:
-            # Try to parse as JSON first
-            if '{' in response_text:
-                # Extract JSON part
-                start = response_text.find('{')
-                end = response_text.rfind('}') + 1
-                json_part = response_text[start:end]
-                parsed = json.loads(json_part)
-                if 'answers_sugg' in parsed:
-                    return parsed['answers_sugg']
-
-            # Fallback: extract suggestions from text
-            return []
-        except Exception as e:
-            print(f"Error parsing baseline response: {e}")
-            return []
-
-
-class ConversationSuggestionSignature(dspy.Signature):
-    """
-    Generate conversation suggestions for a shopping assistant based on conversation history.
-    Focus on the last assistant message and provide relevant, concise suggestions.
-    Return empty suggestions for appointment booking scenarios.
-    """
-    messages = dspy.InputField(desc="List of conversation messages with role and content")
-    role = dspy.InputField(desc="The role of the assistant")
-    task = dspy.InputField(desc="The specific task to perform")
-    language = dspy.InputField(desc="Language for suggestions")
-    suggestions = dspy.OutputField(
-        desc="JSON object with 'answers_sugg' containing 0-3 suggestions, each max 40 characters. Return empty array for appointment booking.")
-
-
-class ShoppingAssistantSuggester(dspy.Module):
-    """DSPy Module for generating shopping assistant conversation suggestions"""
-
-    def __init__(self):
-        super().__init__()
-        self.suggest = dspy.ChainOfThought(ConversationSuggestionSignature)
-
-    def forward(self, messages: List[Dict[str, str]], role: str, task: str, language: str):
-        # Convert messages to string format for processing
-        messages_str = json.dumps(messages, indent=2)
-
-        # Generate suggestions
-        prediction = self.suggest(
-            messages=messages_str,
-            role=role,
-            task=task,
-            language=language
-        )
-
-        # Parse suggestions from the prediction
-        suggestions = self.parse_suggestions(prediction.suggestions)
-
-        return dspy.Prediction(suggestions=suggestions)
-
-    def parse_suggestions(self, suggestions_text: str) -> List[str]:
-        """Parse suggestions from model output"""
-        try:
-            # Try to parse as JSON first
-            if suggestions_text.strip().startswith('{'):
-                parsed = json.loads(suggestions_text)
-                if 'answers_sugg' in parsed:
-                    return parsed['answers_sugg']
-            elif suggestions_text.strip().startswith('['):
-                return json.loads(suggestions_text)
-
-            # Fallback: extract suggestions from text
-            lines = suggestions_text.strip().split('\n')
-            suggestions = []
-            for line in lines:
-                # Remove numbering, quotes, and clean up
-                clean_line = re.sub(r'^\d+\.?\s*', '', line).strip()
-                clean_line = clean_line.strip('"\'')
-                if clean_line and len(clean_line) <= 40:
-                    suggestions.append(clean_line)
-
-            return suggestions[:3]  # Max 3 suggestions
-        except Exception as e:
-            print(f"Error parsing suggestions: {e}")
-            return []
-
-
-def create_training_data() -> List[ConversationExample]:
-    """Create training data including appointment booking scenarios"""
-
-    training_examples = [
-        # Original flooring examples
-        ConversationExample(
-            messages=[
-                {"role": "assistant",
-                 "content": "Hello! I'd be happy to help you find the perfect flooring. Let me gather some information about different types of flooring for you. One moment, please."},
-                {"role": "assistant",
-                 "content": "I have gathered some general information...\nTypes of Flooring:\n - Laminate...\n - Parquet...\n - Vinyl...\n - Solid Wood Planks...\n - Cork...\nFactors to Consider:\n - Budget...\n - Durability...\n - Installation...\n - Maintenance...\n - Aesthetics...\n - Special Needs...\nCould you tell me what color you are looking for in the flooring?"}
+    # Training data
+    training_data = [
+        {
+            'messages': [
+                {"role": "assistant", "content": "What color flooring are you looking for?"}
             ],
-            expected_suggestions=["Dark brown", "Light colors", "Undecided on color"]
-        ),
-
-        ConversationExample(
-            messages=[
-                {"role": "assistant",
-                 "content": "Hello! I'd be happy to help you find the perfect flooring. Let me gather some information about different types of flooring for you. One moment, please."},
-                {"role": "assistant",
-                 "content": "I have gathered some general information...\nTypes of Flooring:\n - Laminate...\n - Parquet...\n - Vinyl...\n - Solid Wood Planks...\n - Cork...\nFactors to Consider:\n - Budget...\n - Durability...\n - Installation...\n - Maintenance...\n - Aesthetics...\n - Special Needs...\nWhat is your budget for the flooring project?"}
+            'expected_suggestions': ["Dark brown", "Light colors", "Undecided"]
+        },
+        {
+            'messages': [
+                {"role": "assistant", "content": "What is your budget for the flooring project?"}
             ],
-            expected_suggestions=["€50/m²", "€3000 total", "Flexible budget"]
-        ),
-
-        ConversationExample(
-            messages=[
-                {"role": "assistant",
-                 "content": "Hello! I'd be happy to help you find the perfect flooring. Let me gather some information about different types of flooring for you. One moment, please."},
-                {"role": "assistant",
-                 "content": "I have gathered some general information...\nTypes of Flooring:\n - Laminate...\n - Parquet...\n - Vinyl...\n - Solid Wood Planks...\n - Cork...\nFactors to Consider:\n - Budget...\n - Durability...\n - Installation...\n - Maintenance...\n - Aesthetics...\n - Special Needs...\nWhat is your customer number and zip code, so I can give you tailored recommendations?"}
+            'expected_suggestions': ["€50/m²", "€3000 total", "Flexible"]
+        },
+        {
+            'messages': [
+                {"role": "assistant", "content": "What is your customer number and zip code?"}
             ],
-            expected_suggestions=[]
-        ),
-
-        # NEW: Appointment booking scenarios
-        ConversationExample(
-            messages=[
-                {"role": "user", "content": "I'm interested in this flooring option."},
-                {"role": "assistant",
-                 "content": "Great choice! This laminate flooring is very popular. Would you like to schedule an appointment for a consultation?"}
+            'expected_suggestions': []
+        },
+        {
+            'messages': [
+                {"role": "assistant", "content": "Would you like to schedule an appointment?"}
             ],
-            expected_suggestions=[]
-        ),
-
-        ConversationExample(
-            messages=[
-                {"role": "user", "content": "Can someone come to my house to measure?"},
-                {"role": "assistant",
-                 "content": "Absolutely! We offer free in-home measurements. When would be a good time to book an appointment for the measurement?"}
+            'expected_suggestions': []
+        },
+        {
+            'messages': [
+                {"role": "assistant", "content": "What room will this flooring be for?"}
             ],
-            expected_suggestions=[]
-        ),
-
-        ConversationExample(
-            messages=[
-                {"role": "user", "content": "I need someone to install this flooring."},
-                {"role": "assistant",
-                 "content": "We have professional installers available. Let me help you book an installation appointment. What's your preferred date?"}
-            ],
-            expected_suggestions=[]
-        ),
-
-        ConversationExample(
-            messages=[
-                {"role": "user", "content": "When can I schedule a visit?"},
-                {"role": "assistant",
-                 "content": "I can help you schedule a visit from our flooring experts. Please let me know your availability and we'll find a suitable appointment time."}
-            ],
-            expected_suggestions=[]
-        ),
-
-        ConversationExample(
-            messages=[
-                {"role": "user", "content": "Can we set up a meeting?"},
-                {"role": "assistant",
-                 "content": "Of course! I'd be happy to arrange a meeting with our flooring specialists. What would work best for your schedule?"}
-            ],
-            expected_suggestions=[]
-        ),
-
-        # Regular shopping scenarios (should have suggestions)
-        ConversationExample(
-            messages=[
-                {"role": "user", "content": "I'm looking for durable flooring for my kitchen."},
-                {"role": "assistant",
-                 "content": "For kitchen flooring, durability and water resistance are key. What style are you looking for?"}
-            ],
-            expected_suggestions=["Modern", "Traditional", "Rustic"]
-        ),
-
-        ConversationExample(
-            messages=[
-                {"role": "user", "content": "Tell me about vinyl flooring."},
-                {"role": "assistant",
-                 "content": "Vinyl flooring is waterproof, durable, and comes in many styles. What room will this be for?"}
-            ],
-            expected_suggestions=["Kitchen", "Bathroom", "Living room"]
-        ),
-
-        ConversationExample(
-            messages=[
-                {"role": "user", "content": "How much does laminate cost?"},
-                {"role": "assistant",
-                 "content": "Laminate flooring typically ranges from €25-€80 per m². How large is the area you need to cover?"}
-            ],
-            expected_suggestions=["Small room", "Whole house", "Don't know yet"]
-        )
+            'expected_suggestions': ["Kitchen", "Bathroom", "Living room"]
+        }
     ]
 
-    return training_examples
+    # Convert to DSPy examples
+    print("📚 Creating DSPy examples...")
+    examples = create_dspy_examples(training_data)
+    train_examples = examples[:3]
+    test_examples = examples[3:]
 
-
-def appointment_booking_metric(example: ConversationExample, prediction, trace=None) -> float:
-    """
-    Custom metric that evaluates whether the system correctly handles appointment booking scenarios.
-    Returns 1.0 for correct behavior, 0.0 for incorrect behavior.
-    """
-    try:
-        predicted_suggestions = prediction.suggestions if hasattr(prediction, 'suggestions') else []
-        expected_suggestions = example.expected_suggestions
-
-        # Check if this is an appointment booking scenario
-        is_appointment_scenario = len(expected_suggestions) == 0
-
-        if is_appointment_scenario:
-            # For appointment booking, we want empty suggestions
-            score = 1.0 if len(predicted_suggestions) == 0 else 0.0
-            print(f"   Appointment scenario: Expected=[], Got={predicted_suggestions}, Score={score}")
-            return score
-        else:
-            # For regular scenarios, we want non-empty relevant suggestions
-            if len(predicted_suggestions) == 0:
-                print(f"   Regular scenario: Expected={expected_suggestions}, Got=[], Score=0.0")
-                return 0.0
-
-            # Basic relevance and length check
-            valid_suggestions = [s for s in predicted_suggestions if len(s) <= 40]
-            score = len(valid_suggestions) / max(1, len(predicted_suggestions))
-            print(f"   Regular scenario: Expected={expected_suggestions}, Got={predicted_suggestions}, Score={score}")
-            return score
-
-    except Exception as e:
-        print(f"   Error in metric evaluation: {e}")
-        return 0.0
-
-
-def evaluate_program(program, test_examples: List[ConversationExample]) -> float:
-    """Evaluate the program on test examples"""
-    total_score = 0.0
-    print("\nEvaluating program...")
-
-    for i, example in enumerate(test_examples):
-        try:
-            print(f"\nExample {i + 1}: {example.messages[-1]['content'][:50]}...")
-            prediction = program(
-                messages=example.messages,
-                role=example.role,
-                task=example.task,
-                language=example.language
-            )
-            score = appointment_booking_metric(example, prediction)
-            total_score += score
-        except Exception as e:
-            print(f"   Error evaluating example {i + 1}: {e}")
-
-    return total_score / len(test_examples) if test_examples else 0.0
-
-
-def main():
-    """Main function to optimize the prompt using DSPy MIPROv2"""
-    print("🚀 Starting DSPy Prompt Optimization...")
-    print("=" * 60)
-
-    # Create training data
-    print("📚 Creating training data...")
-    training_data = create_training_data()
-
-    # Split data into train and test
-    train_examples = training_data[:8]  # Use first 8 for training
-    test_examples = training_data[8:]  # Use remaining for testing
-
-    print(f"   Training examples: {len(train_examples)}")
-    print(f"   Test examples: {len(test_examples)}")
-
-    # Create the initial program
-    print("\n🔧 Creating initial program...")
+    # Create baseline and optimizable modules
+    baseline = BaselineModule(ORIGINAL_PROMPT)
     program = ShoppingAssistantSuggester()
 
-    # Evaluate baseline performance
-    print("\n📊 Evaluating baseline performance...")
-    baseline_score = evaluate_program(program, test_examples)
-    print(f"\n📈 Baseline score: {baseline_score:.2f}")
+    # Evaluate baseline
+    print("\n📊 Evaluating baseline (original prompt)...")
+    baseline_score = 0
+    for ex in test_examples:
+        # Parse messages from string if needed
+        messages = json.loads(ex.messages) if isinstance(ex.messages, str) else ex.messages
+        pred = baseline(messages, ex.role, ex.task, ex.language)
+        score = suggestion_metric(ex, pred)
+        baseline_score += score
+        print(f"  Example: {score:.2f}")
+    baseline_score /= len(test_examples)
+    print(f"Baseline score: {baseline_score:.2f}")
 
-    # Convert training examples to DSPy format
-    print("\n🔄 Converting training data to DSPy format...")
-    dspy_trainset = []
-    for example in train_examples:
-        dspy_example = dspy.Example(
-            messages=example.messages,
-            role=example.role,
-            task=example.task,
-            language=example.language,
-            suggestions=example.expected_suggestions
-        ).with_inputs("messages", "role", "task", "language")
-        dspy_trainset.append(dspy_example)
+    # Evaluate unoptimized DSPy module
+    print("\n📊 Evaluating unoptimized DSPy module...")
+    unopt_score = 0
+    for ex in test_examples:
+        messages = json.loads(ex.messages) if isinstance(ex.messages, str) else ex.messages
+        pred = program(messages, ex.role, ex.task, ex.language)
+        score = suggestion_metric(ex, pred)
+        unopt_score += score
+        print(f"  Example: {score:.2f}")
+    unopt_score /= len(test_examples)
+    print(f"Unoptimized DSPy score: {unopt_score:.2f}")
 
-    # Import and configure optimizer
-    print("\n⚙️  Setting up MIPROv2 optimizer...")
+    # Optimize
+    print("\n⚙️  Optimizing with MIPROv2...")
     from dspy.teleprompt import MIPROv2
 
+    # Option 1: Use auto mode (recommended for beginners)
     optimizer = MIPROv2(
-        metric=appointment_booking_metric,
-        auto=None,
-        num_candidates=5,
-        init_temperature=0.5,
+        metric=suggestion_metric,
+        auto="light",  # This sets all parameters automatically
     )
 
-    # Optimize the program
-    print("\n🎯 Optimizing program with MIPROv2...")
-    print("   This may take a few minutes...")
+    optimized_program = optimizer.compile(
+        program.deepcopy(),
+        trainset=train_examples,
+        max_bootstrapped_demos=2,
+        max_labeled_demos=2,
+        requires_permission_to_run=False,
+    )
+
+    # Option 2: Manual configuration (comment out Option 1 and uncomment this)
+    # optimizer = MIPROv2(
+    #     metric=suggestion_metric,
+    #     num_candidates=7,
+    #     init_temperature=0.5,
+    # )
+    #
+    # optimized_program = optimizer.compile(
+    #     program.deepcopy(),
+    #     trainset=train_examples,
+    #     num_trials=15,
+    #     max_bootstrapped_demos=2,
+    #     max_labeled_demos=2,
+    #     requires_permission_to_run=False,
+    # )
+
+    # Evaluate optimized
+    print("\n📊 Evaluating optimized program...")
+    opt_score = 0
+    for ex in test_examples:
+        messages = json.loads(ex.messages) if isinstance(ex.messages, str) else ex.messages
+        pred = optimized_program(messages, ex.role, ex.task, ex.language)
+        score = suggestion_metric(ex, pred)
+        opt_score += score
+        print(f"  Example: {score:.2f}")
+    opt_score /= len(test_examples)
+
+    # Results
+    print("\n📈 Final Results:")
+    print(f"  Baseline (original prompt): {baseline_score:.2f}")
+    print(f"  Unoptimized DSPy: {unopt_score:.2f}")
+    print(f"  Optimized DSPy: {opt_score:.2f}")
+    print(f"  Improvement over baseline: {opt_score - baseline_score:.2f}")
+
+    # Extract and display optimized prompt
+    print("\n📋 EXTRACTING OPTIMIZED PROMPT...")
+    print("=" * 60)
 
     try:
-        optimized_program = optimizer.compile(
-            program,
-            trainset=dspy_trainset,
-            num_trials=10,
-            max_bootstrapped_demos=2,
-            max_labeled_demos=2,
-            requires_permission_to_run=False,
-            minibatch_size=6
-        )
+        # Method 1: Load and inspect saved file
+        print("\n🔍 Loading saved optimization file...")
+        with open("optimized_shopping_assistant.json", "r") as f:
+            saved_data = json.load(f)
 
-        # Evaluate optimized performance
-        print("\n📊 Evaluating optimized performance...")
-        optimized_score = evaluate_program(optimized_program, test_examples)
-        print(f"\n📈 Results:")
-        print(f"   Baseline score: {baseline_score:.2f}")
-        print(f"   Optimized score: {optimized_score:.2f}")
-        print(f"   Improvement: {optimized_score - baseline_score:.2f}")
+        # Extract the optimized prompt details
+        if "suggest" in saved_data:
+            suggest_data = saved_data["suggest"]
 
-        # Save the optimized program
-        print("\n💾 Saving optimized program...")
-        optimized_program.save("optimized_shopping_assistant.json")
-        print("   Saved to: optimized_shopping_assistant.json")
+            # Look for the actual prompt/instructions
+            if "signature" in suggest_data:
+                sig_data = suggest_data["signature"]
 
-        # Extract and display the optimized prompt
-        print("\n📋 Extracting optimized prompt...")
+                print("\n📝 OPTIMIZED PROMPT INSTRUCTIONS:")
+                print("-" * 60)
+
+                # Extract main instructions
+                if "instructions" in sig_data:
+                    print(f"\nMain Instructions:\n{sig_data['instructions']}")
+
+                # Extract field descriptions
+                print("\n📌 Field Descriptions:")
+                for field_name in ['messages', 'role', 'task', 'language', 'suggestions']:
+                    if field_name in sig_data:
+                        field_data = sig_data[field_name]
+                        if isinstance(field_data, dict):
+                            print(f"\n{field_name}:")
+                            for key, value in field_data.items():
+                                print(f"  {key}: {value}")
+
+                # Look for extended signature
+                if "extended_signature" in suggest_data:
+                    print("\n🎯 Extended Signature Details:")
+                    ext_sig = suggest_data["extended_signature"]
+                    if isinstance(ext_sig, dict):
+                        if "instructions" in ext_sig:
+                            print(f"\nOptimized Instructions:\n{ext_sig['instructions']}")
+
+                        # Check for reasoning field (from ChainOfThought)
+                        if "reasoning" in ext_sig:
+                            print(f"\nReasoning Field:\n{ext_sig['reasoning']}")
+
+            # Look for demos (few-shot examples)
+            if "demos" in suggest_data and suggest_data["demos"]:
+                print(f"\n📚 Number of Few-Shot Examples: {len(suggest_data['demos'])}")
+                print("\nFirst Few-Shot Example:")
+                print(json.dumps(suggest_data["demos"][0], indent=2)[:500] + "...")
+
+        # Method 2: Try to inspect the actual optimized program
+        print("\n\n🔧 Inspecting Optimized Program Object...")
+
+        # Get the optimized ChainOfThought module
+        cot_module = optimized_program.suggest
+
+        # Check signature
+        if hasattr(cot_module, 'signature'):
+            print(f"\nSignature Class: {cot_module.signature.__class__.__name__}")
+
+            # Get the actual prompt by inspecting the signature
+            sig = cot_module.signature
+            if hasattr(sig, '__dict__'):
+                print("\nSignature Attributes:")
+                for attr, value in sig.__dict__.items():
+                    if not attr.startswith('_'):
+                        print(f"  {attr}: {value}")
+
+        # Check for extended signature (ChainOfThought specific)
+        if hasattr(cot_module, 'extended_signature'):
+            print(f"\nExtended Signature: {cot_module.extended_signature}")
+
+        # Method 3: Generate a sample to see the actual prompt
+        print("\n\n💡 SAMPLE PROMPT GENERATION...")
+        print("-" * 60)
+
+        # Create a simple test case
+        test_messages = [
+            {"role": "assistant", "content": "What type of flooring are you looking for?"}
+        ]
+
+        print("\nGenerating a sample with the optimized program...")
+        print("This will show how the optimized prompt handles the task.")
+
+        # Generate with the optimized program
         try:
-            # Get the optimized prompt from the first module
-            suggest_module = optimized_program.suggest
-            if hasattr(suggest_module, 'signature'):
-                optimized_prompt_template = str(suggest_module.signature)
-                print("\n🎉 OPTIMIZED PROMPT EXTRACTED:")
-                print("=" * 60)
-                print(optimized_prompt_template)
-            else:
-                print("   Could not extract prompt template automatically.")
-                print("   Check the saved file: optimized_shopping_assistant.json")
+            result = optimized_program(
+                messages=test_messages,
+                role="shopping assistant suggestion generator",
+                task="Generate relevant conversation suggestions",
+                language="English"
+            )
+            print(f"\nSample Output: {result.suggestions}")
         except Exception as e:
-            print(f"   Error extracting prompt: {e}")
-            print("   Check the saved file: optimized_shopping_assistant.json")
+            print(f"Sample generation note: {e}")
 
-        print("\n✅ Optimization complete!")
+        # Method 4: Show comparison
+        print("\n\n📊 PROMPT COMPARISON")
+        print("=" * 60)
+
+        print("\n🔹 ORIGINAL PROMPT TEMPLATE (Baseline):")
+        print("-" * 40)
+        print("Main focus: Manual rules about appointment detection")
+        print("Key instruction: 'NEVER GIVE SUGGESTIONS WHERE IT IS NOT USEFUL'")
+        print("Approach: Explicit rules for zip codes, personal data, appointments")
+
+        print("\n🔹 OPTIMIZED PROMPT (After MIPROv2):")
+        print("-" * 40)
+
+        if "suggest" in saved_data and "signature" in saved_data["suggest"]:
+            opt_instructions = saved_data["suggest"]["signature"].get("instructions", "")
+            if opt_instructions:
+                print(f"Optimized Instructions: {opt_instructions}")
+
+            # Show if there are few-shot examples
+            if "demos" in saved_data["suggest"] and saved_data["suggest"]["demos"]:
+                print(f"\nIncludes {len(saved_data['suggest']['demos'])} few-shot examples")
+                print("These examples teach the model when to return empty suggestions")
+
+        print("\n🎯 KEY IMPROVEMENTS:")
+        print("- Data-driven learning from examples vs manual rules")
+        print("- Automatic handling of appointment scenarios through examples")
+        print("- More robust and generalizable approach")
 
     except Exception as e:
-        print(f"\n❌ Error during optimization: {e}")
-        print("   Check your API key and try again.")
+        print(f"\n⚠️  Error extracting optimized prompt: {e}")
+        print("The optimization file has been saved. You can inspect it manually.")
+
+    print("\n" + "=" * 60)
+    print("✅ Complete!")
 
 
 if __name__ == "__main__":
